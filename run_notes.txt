@@ -1,0 +1,10 @@
+python main.py --data data/MPIIFaceGaze --dataset mpiigaze --arch resnet34 --batch-size 100 --num-workers 2 --output output --alpha 1 --amp
+
+
+python evaluate.py --data data/MPIIFaceGaze --dataset mpiigaze --weight output/best_model.pt --arch resnet34 --num-workers 2 --batch-size 100
+
+
+python inference.py --model resnet34 --weight output/best_model.pt --view --dataset mpiigaze --source http://192.168.2.223:8080/video
+
+
+
