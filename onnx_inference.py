@@ -35,16 +35,30 @@ def _ort_type_to_np(ort_type: str):
     }.get(ort_type, np.float32)
 
 
+
+
+
+
+# ==== TUNABLES (start here) ====
+HFOV_DEG = 90.0   # Brio wide = 90, medium = 78, narrow = 65
+VFOV_DEG = None   # let code infer from aspect; or set explicitly if you know it
+Y_UP     = True   # match your draw convention (you used y_up earlier)
+MIRROR_X = False  # set True if your displayed frame is horizontally mirrored
+CX_BIAS_PX = 0.0  # tweak if lens center != image center (positive = shift right)
+CY_BIAS_PX = 0.0  # tweak if lens center != image center (positive = shift down)
+BASE_THRESH = 10.0  # deg (close faces)
+MAX_THRESH  = 28.0 #22.0  # deg cap for tiny/far faces
+REF_FACE    = 120.0 # px reference face size for threshold scaling
+# ===============================
+
 def _focal_px_from_fov(img_w, img_h, hfov_deg=60.0, vfov_deg=None):
-    # approximate focal length (pixels) from FOV
-    f_x = (img_w/2.0) / np.tan(np.deg2rad(hfov_deg)/2.0)
+    fx = (img_w/2.0) / np.tan(np.deg2rad(hfov_deg)/2.0)
     if vfov_deg is None:
-        # derive vertical FOV from aspect
         vfov = 2*np.rad2deg(np.arctan((img_h/img_w)*np.tan(np.deg2rad(hfov_deg)/2.0)))
     else:
         vfov = vfov_deg
-    f_y = (img_h/2.0) / np.tan(np.deg2rad(vfov)/2.0)
-    return f_x, f_y
+    fy = (img_h/2.0) / np.tan(np.deg2rad(vfov)/2.0)
+    return fx, fy
 
 def gaze_vec_from_angles(pitch, yaw, y_up=True):
     cp, sp = np.cos(pitch), np.sin(pitch)
@@ -55,32 +69,47 @@ def gaze_vec_from_angles(pitch, yaw, y_up=True):
     v = np.array([vx, vy, vz], dtype=np.float32)
     return v / (np.linalg.norm(v)+1e-9)
 
-def target_angles_to_lens(cx, cy, img_w, img_h, hfov_deg=60.0, vfov_deg=None, y_up=True):
-    # offset from principal point (assume center)
-    dx = cx - (img_w/2.0)
-    dy = cy - (img_h/2.0)
-    f_x, f_y = _focal_px_from_fov(img_w, img_h, hfov_deg, vfov_deg)
-    # small-angle model: direction from pixel to lens optical axis
-    # yaw right+, pitch up+
-    yaw_tgt   = np.arctan2(dx, f_x)
-    pitch_tgt = np.arctan2((-dy if y_up else dy), f_y)
+def target_angles_to_lens(cx_px, cy_px, img_w, img_h,
+                          hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG,
+                          mirror_x=MIRROR_X, cx_bias=CX_BIAS_PX, cy_bias=CY_BIAS_PX,
+                          y_up=Y_UP):
+    # principal point (allow bias)
+    c0x = img_w/2.0 + cx_bias
+    c0y = img_h/2.0 + cy_bias
+
+    # horizontal mirroring (many selfie previews are mirrored)
+    if mirror_x:
+        cx_px = (img_w - 1) - cx_px
+
+    dx = cx_px - c0x
+    dy = cy_px - c0y
+
+    fx, fy = _focal_px_from_fov(img_w, img_h, hfov_deg, vfov_deg)
+    yaw_tgt   = np.arctan2(dx, fx)                  # +right
+    pitch_tgt = np.arctan2(( -dy if y_up else dy ), fy)  # +up if y_up
     return pitch_tgt, yaw_tgt
 
-def angular_error_deg(pitch_a, yaw_a, pitch_b, yaw_b, y_up=True):
+def angular_error_deg(pitch_a, yaw_a, pitch_b, yaw_b, y_up=Y_UP):
     va = gaze_vec_from_angles(pitch_a, yaw_a, y_up=y_up)
     vb = gaze_vec_from_angles(pitch_b, yaw_b, y_up=y_up)
-    cos_t = float(np.clip(np.dot(va, vb), -1.0, 1.0))
-    return np.degrees(np.arccos(cos_t))
+    ct = float(np.clip(np.dot(va, vb), -1.0, 1.0))
+    return np.degrees(np.arccos(ct))
 
-# def is_looking_at_camera(gaze_vec: np.ndarray, fwd=np.array([0,0,1],dtype=np.float32), thresh_deg=10.0):
-#     """
-#     True if angle between gaze_vec and camera forward is within thresh_deg.
-#     """
-#     gaze = gaze_vec / (np.linalg.norm(gaze_vec) + 1e-9)
-#     fwd  = fwd / (np.linalg.norm(fwd) + 1e-9)
-#     cos_t = float(np.clip(np.dot(gaze, fwd), -1.0, 1.0))
-#     theta = np.degrees(np.arccos(cos_t))
-#     return theta <= thresh_deg, theta
+
+def crop_with_padding(frame, x_min, y_min, x_max, y_max, pad_ratio=0.25):
+    h, w = frame.shape[:2]
+    bw, bh = x_max - x_min, y_max - y_min
+    pad_x, pad_y = int(bw * pad_ratio), int(bh * pad_ratio)
+
+    x0 = max(0, x_min - pad_x)
+    y0 = max(0, y_min - pad_y)
+    x1 = min(w, x_max + pad_x)
+    y1 = min(h, y_max + pad_y)
+
+    return frame[y0:y1, x0:x1]
+
+
+
 
 
 def _softmax(x, axis=-1):
@@ -198,7 +227,8 @@ class GazeEstimationONNX:
 
         # Resize
         if cv2 is not None:
-            img_resized = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+            # img_resized = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+            img_resized = cv2.resize(img, (W, H), interpolation=cv2.INTER_CUBIC)
         else:
             img_resized = np.array(Image.fromarray(img).resize((W, H), Image.BILINEAR))
 
@@ -339,55 +369,55 @@ if __name__ == "__main__":
 
         for bbox in bboxes:
             x_min, y_min, x_max, y_max = map(int, bbox[:4])
-            face_crop = frame[y_min:y_max, x_min:x_max]
+
+            h, w = frame.shape[:2]
+            min_face_px = int(0.025 * min(w, h))  # ~2.5% of min dimension
+            min_face_px = np.clip(min_face_px, 48, 120)  # keep sane bounds for 4K
+
+            # Skip small face boxes
+            w_box = x_max - x_min
+            h_box = y_max - y_min
+            if min(w_box, h_box) < min_face_px:
+                continue
+
+            # face_crop = frame[y_min:y_max, x_min:x_max]
+            face_crop = crop_with_padding(frame, x_min, y_min, x_max, y_max, pad_ratio=0.25)
             if face_crop.size == 0:
                 continue
 
             pitch, yaw = engine.estimate(face_crop)  # radians
             draw_bbox_gaze(frame, bbox, pitch, yaw)
 
-            # # Build 3D gaze vector (unit length), compare to camera forward (0,0,1)
-            # gvec = gaze_vector_from_angles(pitch, yaw, convention="y_up")
-            # looking, angle_deg = is_looking_at_camera(gvec, thresh_deg=15.0)  # tweak threshold 8–12°
-
-            # if looking:
-            #     # Optional: also check that the face center is near image center (helps avoid false positives)
-            #     h, w = frame.shape[:2]
-            #     cx = (x_min + x_max) // 2
-            #     cy = (y_min + y_max) // 2
-            #     # distance from center normalized by min dimension
-            #     d = np.hypot(cx - w//2, cy - h//2) / max(1, min(w, h))
-            #     if d < 0.2:  # tweak 0.15–0.25 depending on your FOV
-            #         cv2.putText(frame, "Looking at you",
-            #                     (x_min, max(0, y_min - 10)),
-            #                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
 
 
+            # After you get (pitch, yaw) in radians:
+            cx = 0.5*(x_min + x_max)
+            cy = 0.5*(y_min + y_max)
 
-            # tune once for your camera
-            HFOV_DEG = 90 #60.0  # replace with your real horizontal FOV if you know it
-            Y_UP = True      # match your drawing convention
+            pitch_tgt, yaw_tgt = target_angles_to_lens(
+                cx, cy, w, h,
+                hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG,
+                mirror_x=MIRROR_X, cx_bias=CX_BIAS_PX, cy_bias=CY_BIAS_PX,
+                y_up=Y_UP
+            )
 
-            h, w = frame.shape[:2]
-            cx = (x_min + x_max) * 0.5
-            cy = (y_min + y_max) * 0.5
-            pitch_tgt, yaw_tgt = target_angles_to_lens(cx, cy, w, h, hfov_deg=HFOV_DEG, y_up=Y_UP)
-
-            # your predicted radians from engine.estimate(...)
-            pitch_pred, yaw_pred = pitch, yaw
-
-            # adaptive threshold: looser for small boxes (far faces), tighter for big boxes
+            # Adaptive threshold: looser when the face is small/far
             box_sz = min(x_max - x_min, y_max - y_min)
-            BASE = 10.0         # deg for close faces
-            K = 50.0            # how much to widen when box is tiny (tune)
-            REF = 120.0         # px reference face size (tune)
-            thresh_deg = np.clip(BASE + K * max(0.0, (REF - box_sz)/REF), 10.0, 22.0)
+            thresh_deg = float(np.clip(BASE_THRESH + 50.0*max(0.0, (REF_FACE - box_sz)/REF_FACE),
+                                    BASE_THRESH, MAX_THRESH))
 
-            err_deg = angular_error_deg(pitch_pred, yaw_pred, pitch_tgt, yaw_tgt, y_up=Y_UP)
+            err_deg = angular_error_deg(pitch, yaw, pitch_tgt, yaw_tgt, y_up=Y_UP)
+
             if err_deg <= thresh_deg:
                 cv2.putText(frame, "Looking at you",
                             (x_min, max(0, y_min - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
+
+            # (Optional) debug overlay to help tuning:
+            cv2.putText(frame, f"err:{err_deg:.1f} yaw_t:{np.degrees(yaw_tgt):.1f} pitch_t:{np.degrees(pitch_tgt):.1f}",
+                        (x_min, y_min-28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 2, cv2.LINE_AA)
+
+
 
                                 
 
