@@ -35,6 +35,42 @@ def _ort_type_to_np(ort_type: str):
     }.get(ort_type, np.float32)
 
 
+
+# --- Simple gaze-length mode tunables ---
+HFOV_DEG   = 90.0     # Brio wide=90, medium=78, narrow=65
+VFOV_DEG   = None     # infer from aspect
+Y_UP       = False    # OpenCV draw is y-down; keep False unless you draw y-up
+
+# Initial threshold: ~2% of the short side (22px @1080p, 43px @4K)
+L_THRESH_INIT = 0.02
+
+# Optional: hard caps for threshold in pixels
+L_THRESH_MIN_PX = 18.0
+L_THRESH_MAX_PX = 60.0
+
+
+
+def _fx_fy(img_w, img_h, hfov_deg=90.0, vfov_deg=None):
+    fx = (img_w/2.0) / np.tan(np.deg2rad(hfov_deg)/2.0)
+    if vfov_deg is None:
+        vfov = 2*np.rad2deg(np.arctan((img_h/img_w) * np.tan(np.deg2rad(hfov_deg)/2.0)))
+    else:
+        vfov = vfov_deg
+    fy = (img_h/2.0) / np.tan(np.deg2rad(vfov)/2.0)
+    return fx, fy
+
+def gaze_offset_px(pitch, yaw, w, h, hfov_deg=90.0, vfov_deg=None, y_up=False):
+    """
+    Project the gaze (pitch,yaw in radians) to pixel offsets from the face center.
+    Returns (du, dv) in pixels. Length sqrt(du^2+dv^2) is your on-screen vector length.
+    """
+    fx, fy = _fx_fy(w, h, hfov_deg, vfov_deg)
+    u = fx * np.tan(yaw)                         # right +
+    v = fy * np.tan(-pitch if y_up else pitch)   # up + if y_up, else y-down
+    return float(u), float(v)
+
+
+
 def gaze_vector_from_angles(pitch_rad: float, yaw_rad: float, convention="y_up"):
     """
     Convert (pitch,yaw) -> 3D unit vector.
@@ -301,6 +337,20 @@ if __name__ == "__main__":
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
 
+
+
+    # Compute a persistent pixel threshold from the chosen %. Recompute if resolution changes.
+    ret, frame0 = cap.read()
+    if not ret:
+        raise IOError("Could not grab first frame to size threshold.")
+    h0, w0 = frame0.shape[:2]
+    L_thresh_px = float(np.clip(L_THRESH_INIT * min(w0, h0), L_THRESH_MIN_PX, L_THRESH_MAX_PX))
+
+    # If you want to reuse that first frame, show it, then continue as usual:
+    cv2.imshow("Gaze Estimation", frame0)
+
+
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -317,21 +367,47 @@ if __name__ == "__main__":
             pitch, yaw = engine.estimate(face_crop)  # radians
             draw_bbox_gaze(frame, bbox, pitch, yaw)
 
-            # Build 3D gaze vector (unit length), compare to camera forward (0,0,1)
-            gvec = gaze_vector_from_angles(pitch, yaw, convention="y_up")
-            looking, angle_deg = is_looking_at_camera(gvec, thresh_deg=10.0)  # tweak threshold 8–12°
+            # # Build 3D gaze vector (unit length), compare to camera forward (0,0,1)
+            # gvec = gaze_vector_from_angles(pitch, yaw, convention="y_up")
+            # looking, angle_deg = is_looking_at_camera(gvec, thresh_deg=10.0)  # tweak threshold 8–12°
 
-            if looking:
-                # Optional: also check that the face center is near image center (helps avoid false positives)
-                h, w = frame.shape[:2]
-                cx = (x_min + x_max) // 2
-                cy = (y_min + y_max) // 2
-                # distance from center normalized by min dimension
-                d = np.hypot(cx - w//2, cy - h//2) / max(1, min(w, h))
-                if d < 0.2:  # tweak 0.15–0.25 depending on your FOV
-                    cv2.putText(frame, "Looking at you",
-                                (x_min, max(0, y_min - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
+            # if looking:
+            #     # Optional: also check that the face center is near image center (helps avoid false positives)
+            #     h, w = frame.shape[:2]
+            #     cx = (x_min + x_max) // 2
+            #     cy = (y_min + y_max) // 2
+            #     # distance from center normalized by min dimension
+            #     d = np.hypot(cx - w//2, cy - h//2) / max(1, min(w, h))
+            #     if d < 0.2:  # tweak 0.15–0.25 depending on your FOV
+            #         cv2.putText(frame, "Looking at you",
+            #                     (x_min, max(0, y_min - 10)),
+            #                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
+
+
+            # # Clamp & (optionally) smooth your angles
+            # pitch = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
+            # yaw   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
+            # pitch_s, yaw_s = look_filter.smooth_angles(pitch, yaw)  # reuse your EMA
+
+                        
+            # Clamp angles to model range before projecting (avoids tan blowups)
+            pitch_c = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
+            yaw_c   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
+
+            h, w = frame.shape[:2]
+            du, dv = gaze_offset_px(pitch_c, yaw_c, w, h, hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG, y_up=Y_UP)
+            L = (du*du + dv*dv) ** 0.5
+
+            is_on = (L <= L_thresh_px)  # simple, flicker-free rule
+
+            cv2.putText(frame, f"L:{L:.1f} thr:{L_thresh_px:.1f} {'ON' if is_on else 'off'}",
+                        (x_min, max(0, y_min - 28)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2, cv2.LINE_AA)
+
+            if is_on:
+                cv2.putText(frame, "Looking at you",
+                            (x_min, max(0, y_min - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
 
                                 
 
@@ -339,8 +415,14 @@ if __name__ == "__main__":
             writer.write(frame)
 
         cv2.imshow("Gaze Estimation", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        elif key == ord(']'):
+            L_thresh_px *= 1.1    # looser
+        elif key == ord('['):
+            L_thresh_px /= 1.1    # stricter
+            L_thresh_px = float(np.clip(L_thresh_px, L_THRESH_MIN_PX, L_THRESH_MAX_PX))
 
     cap.release()
     if writer:
