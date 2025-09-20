@@ -58,6 +58,7 @@ class Track:
     on_started_ts: float | None = None   # when the current ON segment began
     on_total_ms: float = 0.0             # cumulative ON milliseconds
     last_update_ts: float | None = None  # last time we updated this track
+    current_dwell_duration: float = 0.0
 
 
 
@@ -69,6 +70,7 @@ class FaceTracker:
         self.tracks: dict[int, Track] = {}
         self._next_id = 1
         self.frame_idx = 0
+        self.max_dwell_threshold_S = 3000
 
     def update_dwell(self, track_id: int, is_on: bool, now_ts: float | None = None):
         now = time.monotonic() if now_ts is None else now_ts
@@ -79,6 +81,10 @@ class FaceTracker:
         # If we’ve been ON, accumulate time since last update
         if tr.last_update_ts is not None and tr.looking_on:
             tr.on_total_ms += max(0.0, (now - tr.last_update_ts) * 1000.0)
+            tr.current_dwell_duration += max(0.0, (now - tr.last_update_ts) * 1000.0)
+
+        if tr.current_dwell_duration > self.max_dwell_threshold_S:
+            print("You've been looking for too long")
 
         # Edge transitions
         if not tr.looking_on and is_on:
@@ -88,6 +94,7 @@ class FaceTracker:
             # close the segment (already accumulated via last_update_ts)
             tr.on_started_ts = None
             tr.looking_on = False
+            tr.current_dwell_duration = 0.0
 
         tr.last_update_ts = now
 
