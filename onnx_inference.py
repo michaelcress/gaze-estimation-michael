@@ -112,6 +112,41 @@ def crop_with_padding(frame, x_min, y_min, x_max, y_max, pad_ratio=0.25):
 
 
 
+# -- Keep your FOV/intrinsics settings from earlier --
+def _fx_fy(img_w, img_h, hfov_deg=90.0, vfov_deg=None):
+    fx = (img_w/2) / np.tan(np.deg2rad(hfov_deg)/2)
+    if vfov_deg is None:
+        vfov = 2*np.rad2deg(np.arctan((img_h/img_w)*np.tan(np.deg2rad(hfov_deg)/2)))
+    else:
+        vfov = vfov_deg
+    fy = (img_h/2) / np.tan(np.deg2rad(vfov)/2)
+    return fx, fy
+
+def looking_at_camera_px(pitch, yaw, cx, cy, w, h,
+                         hfov_deg=90.0, vfov_deg=None,
+                         mirror_x=False, y_up=True,
+                         base_tol_px=12.0,  # base tolerance in pixels (close faces, near center)
+                         size_boost_px=60.0 # extra px tolerance when face is tiny
+                         ):
+    # principal point
+    c0x, c0y = w/2.0, h/2.0
+    if mirror_x: cx = (w - 1) - cx
+    dx, dy = (cx - c0x), (cy - c0y)              # target pixel offset
+
+    fx, fy = _fx_fy(w, h, hfov_deg, vfov_deg)
+
+    # Predicted pixel offsets from gaze angles (small-angle projection)
+    u_pred = fx * np.tan(yaw)                    # right+
+    v_pred = fy * np.tan(-pitch if y_up else pitch)  # up+
+
+    # Distance in pixel space between where the gaze points and the lens direction to the face
+    err_px = np.hypot(u_pred - dx, v_pred - dy)
+
+    return err_px
+
+
+
+
 def _softmax(x, axis=-1):
     x = x.astype(np.float32)
     x = x - np.max(x, axis=axis, keepdims=True)
@@ -390,32 +425,56 @@ if __name__ == "__main__":
 
 
 
-            # After you get (pitch, yaw) in radians:
-            cx = 0.5*(x_min + x_max)
-            cy = 0.5*(y_min + y_max)
+            # # After you get (pitch, yaw) in radians:
+            # cx = 0.5*(x_min + x_max)
+            # cy = 0.5*(y_min + y_max)
 
-            pitch_tgt, yaw_tgt = target_angles_to_lens(
-                cx, cy, w, h,
-                hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG,
-                mirror_x=MIRROR_X, cx_bias=CX_BIAS_PX, cy_bias=CY_BIAS_PX,
-                y_up=Y_UP
-            )
+            # pitch_tgt, yaw_tgt = target_angles_to_lens(
+            #     cx, cy, w, h,
+            #     hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG,
+            #     mirror_x=MIRROR_X, cx_bias=CX_BIAS_PX, cy_bias=CY_BIAS_PX,
+            #     y_up=Y_UP
+            # )
 
-            # Adaptive threshold: looser when the face is small/far
+            # # Adaptive threshold: looser when the face is small/far
+            # box_sz = min(x_max - x_min, y_max - y_min)
+            # thresh_deg = float(np.clip(BASE_THRESH + 50.0*max(0.0, (REF_FACE - box_sz)/REF_FACE),
+            #                         BASE_THRESH, MAX_THRESH))
+
+            # err_deg = angular_error_deg(pitch, yaw, pitch_tgt, yaw_tgt, y_up=Y_UP)
+
+            # if err_deg <= thresh_deg:
+            #     cv2.putText(frame, "Looking at you",
+            #                 (x_min, max(0, y_min - 10)),
+            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
+
+            # # (Optional) debug overlay to help tuning:
+            # cv2.putText(frame, f"err:{err_deg:.1f} yaw_t:{np.degrees(yaw_tgt):.1f} pitch_t:{np.degrees(pitch_tgt):.1f}",
+            #             (x_min, y_min-28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 2, cv2.LINE_AA)
+
+
+
+            cx = 0.5*(x_min + x_max); cy = 0.5*(y_min + y_max)
             box_sz = min(x_max - x_min, y_max - y_min)
-            thresh_deg = float(np.clip(BASE_THRESH + 50.0*max(0.0, (REF_FACE - box_sz)/REF_FACE),
-                                    BASE_THRESH, MAX_THRESH))
 
-            err_deg = angular_error_deg(pitch, yaw, pitch_tgt, yaw_tgt, y_up=Y_UP)
+            err_px = looking_at_camera_px(pitch, yaw, cx, cy, w, h,
+                                        hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG,
+                                        mirror_x=MIRROR_X, y_up=Y_UP)
 
-            if err_deg <= thresh_deg:
+            # tolerance grows with |dx,dy| and with small faces
+            dist_from_center = np.hypot(cx - w/2, cy - h/2)
+            # tol = 12.0 + 0.12*dist_from_center + np.clip((60 - box_sz), 0, 60) * 0.25
+            tol = 18.0 + 0.22*dist_from_center + np.clip((96 - box_sz), 0, 96) * 0.35
+            # examples: near center big face → ~12–18 px; edge small face → ~25–40 px
+
+            if err_px <= tol:
                 cv2.putText(frame, "Looking at you",
                             (x_min, max(0, y_min - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
 
-            # (Optional) debug overlay to help tuning:
-            cv2.putText(frame, f"err:{err_deg:.1f} yaw_t:{np.degrees(yaw_tgt):.1f} pitch_t:{np.degrees(pitch_tgt):.1f}",
-                        (x_min, y_min-28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 2, cv2.LINE_AA)
+            # Optional debug:
+            # cv2.putText(frame, f"err_px:{err_px:.1f} tol:{tol:.1f}", (x_min, y_min-28),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 2, cv2.LINE_AA)
 
 
 
