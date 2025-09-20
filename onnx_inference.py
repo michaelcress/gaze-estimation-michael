@@ -143,24 +143,6 @@ L_THRESH_MAX_PX = 60.0
 
 
 
-class EMASmoother:
-    def __init__(self, alpha=0.2):
-        self.alpha = alpha
-        self.pitch_ema = None
-        self.yaw_ema = None
-
-    def smooth(self, pitch, yaw):
-        if self.pitch_ema is None:
-            # initialize on first call
-            self.pitch_ema = pitch
-            self.yaw_ema = yaw
-        else:
-            self.pitch_ema = self.alpha * pitch + (1 - self.alpha) * self.pitch_ema
-            self.yaw_ema   = self.alpha * yaw   + (1 - self.alpha) * self.yaw_ema
-        return self.pitch_ema, self.yaw_ema
-
-
-
 
 
 def _fx_fy(img_w, img_h, hfov_deg=90.0, vfov_deg=None):
@@ -472,7 +454,7 @@ if __name__ == "__main__":
     h0, w0 = frame0.shape[:2]
     fx, fy = _fx_fy(w0, h0, hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG)
 
-    L_thresh_px = float(np.clip(L_THRESH_INIT * min(w0, h0), L_THRESH_MIN_PX, L_THRESH_MAX_PX))
+    # L_thresh_px = float(np.clip(L_THRESH_INIT * min(w0, h0), L_THRESH_MIN_PX, L_THRESH_MAX_PX))
 
     # If you want to reuse that first frame, show it, then continue as usual:
     cv2.imshow("Gaze Estimation", frame0)
@@ -495,8 +477,51 @@ if __name__ == "__main__":
             
 
         bboxes, _ = detector.detect(frame)
+        
+        # Prepare detections as integer tuples
+        dets = [tuple(map(int, bbox[:4])) for bbox in bboxes]
+        tracked = tracker.update(dets)  # -> list of (track_id, bbox)
 
-        for bbox in bboxes:
+        for track_id, (x_min, y_min, x_max, y_max) in tracked:
+            face_crop = frame[y_min:y_max, x_min:x_max]
+            if face_crop.size == 0:
+                continue
+
+            # Skip tiny faces (helps stability)
+            w_box = x_max - x_min; h_box = y_max - y_min
+            if min(w_box, h_box) < 64:
+                continue
+
+            # Estimate raw angles
+            pitch, yaw = engine.estimate(face_crop)  # radians
+
+            # Clamp, then EMA per-track
+            pitch_c = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
+            yaw_c   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
+            pitch_s, yaw_s = tracker.smooth_angles_for(track_id, pitch_c, yaw_c)
+
+            # Draw using smoothed values (optional: pass smoothed to your drawer)
+            draw_bbox_gaze(frame, (x_min, y_min, x_max, y_max), pitch_s, yaw_s)
+
+            # Project to pixels with cached fx, fy
+            du, dv = gaze_offset_px(pitch_s, yaw_s, fx, fy, y_up=Y_UP)
+            L = (du*du + dv*dv) ** 0.5
+
+            # Threshold scales with face size (your function)
+            face_sz = float(min(w_box, h_box))
+            L_thresh = gaze_thresh_px(face_sz)
+            is_on = (L <= L_thresh)
+
+            # Debug overlay with track id
+            cv2.putText(frame, f"ID:{track_id} L:{L:.1f} thr:{L_thresh:.1f}",
+                        (x_min, max(0, y_min-28)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2, cv2.LINE_AA)
+            if is_on:
+                cv2.putText(frame, "Looking at you",
+                            (x_min, max(0, y_min-10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
+
+        # for bbox in bboxes:
             # x_min, y_min, x_max, y_max = map(int, bbox[:4])
             # face_crop = frame[y_min:y_max, x_min:x_max]
             # if face_crop.size == 0:
@@ -548,51 +573,6 @@ if __name__ == "__main__":
             #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
 
 
-
-            # Prepare detections as integer tuples
-            dets = [tuple(map(int, bbox[:4])) for bbox in bboxes]
-            tracked = tracker.update(dets)  # -> list of (track_id, bbox)
-
-            for track_id, (x_min, y_min, x_max, y_max) in tracked:
-                face_crop = frame[y_min:y_max, x_min:x_max]
-                if face_crop.size == 0:
-                    continue
-
-                # Skip tiny faces (helps stability)
-                w_box = x_max - x_min; h_box = y_max - y_min
-                if min(w_box, h_box) < 64:
-                    continue
-
-                # Estimate raw angles
-                pitch, yaw = engine.estimate(face_crop)  # radians
-
-                # Clamp, then EMA per-track
-                pitch_c = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
-                yaw_c   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
-                pitch_s, yaw_s = tracker.smooth_angles_for(track_id, pitch_c, yaw_c)
-
-                # Draw using smoothed values (optional: pass smoothed to your drawer)
-                draw_bbox_gaze(frame, (x_min, y_min, x_max, y_max), pitch_s, yaw_s)
-
-                # Project to pixels with cached fx, fy
-                du, dv = gaze_offset_px(pitch_s, yaw_s, fx, fy, y_up=Y_UP)
-                L = (du*du + dv*dv) ** 0.5
-
-                # Threshold scales with face size (your function)
-                face_sz = float(min(w_box, h_box))
-                L_thresh = gaze_thresh_px(face_sz)
-                is_on = (L <= L_thresh)
-
-                # Debug overlay with track id
-                cv2.putText(frame, f"ID:{track_id} L:{L:.1f} thr:{L_thresh:.1f}",
-                            (x_min, max(0, y_min-28)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2, cv2.LINE_AA)
-                if is_on:
-                    cv2.putText(frame, "Looking at you",
-                                (x_min, max(0, y_min-10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
-
-
         if writer:
             writer.write(frame)
 
@@ -600,11 +580,6 @@ if __name__ == "__main__":
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        # elif key == ord(']'):
-        #     L_thresh_px *= 1.1    # looser
-        # elif key == ord('['):
-        #     L_thresh_px /= 1.1    # stricter
-        #     L_thresh_px = float(np.clip(L_thresh_px, L_THRESH_MIN_PX, L_THRESH_MAX_PX))
 
     cap.release()
     if writer:
