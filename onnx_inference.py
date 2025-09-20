@@ -28,6 +28,11 @@ from pathlib import Path
 import itertools
 from dataclasses import dataclass
 
+import time
+
+
+
+
 def iou_xyxy(a, b):
     ax0, ay0, ax1, ay1 = a; bx0, by0, bx1, by1 = b
     ix0, iy0 = max(ax0, bx0), max(ay0, by0)
@@ -48,6 +53,14 @@ class Track:
     ema_yaw: float | None = None
     last_seen: int = 0
 
+    # dwell-time bookkeeping
+    looking_on: bool = False
+    on_started_ts: float | None = None   # when the current ON segment began
+    on_total_ms: float = 0.0             # cumulative ON milliseconds
+    last_update_ts: float | None = None  # last time we updated this track
+
+
+
 class FaceTracker:
     def __init__(self, iou_thresh=0.3, max_age=15, alpha=0.2):
         self.iou_thresh = iou_thresh
@@ -56,6 +69,27 @@ class FaceTracker:
         self.tracks: dict[int, Track] = {}
         self._next_id = 1
         self.frame_idx = 0
+
+    def update_dwell(self, track_id: int, is_on: bool, now_ts: float | None = None):
+        now = time.monotonic() if now_ts is None else now_ts
+        tr = self.tracks.get(track_id)
+        if tr is None:
+            return
+
+        # If we’ve been ON, accumulate time since last update
+        if tr.last_update_ts is not None and tr.looking_on:
+            tr.on_total_ms += max(0.0, (now - tr.last_update_ts) * 1000.0)
+
+        # Edge transitions
+        if not tr.looking_on and is_on:
+            tr.on_started_ts = now
+            tr.looking_on = True
+        elif tr.looking_on and not is_on:
+            # close the segment (already accumulated via last_update_ts)
+            tr.on_started_ts = None
+            tr.looking_on = False
+
+        tr.last_update_ts = now
 
     def _smooth(self, tr: Track, pitch, yaw):
         if tr.ema_pitch is None:
@@ -105,9 +139,18 @@ class FaceTracker:
             self.tracks[ti] = Track(track_id=ti, bbox=detections[di], last_seen=self.frame_idx)
 
         # GC stale tracks
-        to_del = [ti for ti, tr in self.tracks.items()
-                  if (self.frame_idx - tr.last_seen) > self.max_age]
-        for ti in to_del: del self.tracks[ti]
+        # to_del = [ti for ti, tr in self.tracks.items()
+        #           if (self.frame_idx - tr.last_seen) > self.max_age]
+        # for ti in to_del: del self.tracks[ti]
+        to_del = []
+        for ti, tr in self.tracks.items():
+            if (self.frame_idx - tr.last_seen) > self.max_age:
+                # finalize any open ON segment
+                if tr.looking_on and tr.last_update_ts is not None:
+                    tr.on_total_ms += max(0.0, (time.monotonic() - tr.last_update_ts) * 1000.0)
+                to_del.append(ti)
+        for ti in to_del:
+            del self.tracks[ti]
 
         # return list of (track_id, bbox)
         return [(ti, self.tracks[ti].bbox) for ti in self.tracks]
@@ -512,10 +555,17 @@ if __name__ == "__main__":
             L_thresh = gaze_thresh_px(face_sz)
             is_on = (L <= L_thresh)
 
+            tracker.update_dwell(track_id, is_on)
+
+
             # Debug overlay with track id
-            cv2.putText(frame, f"ID:{track_id} L:{L:.1f} thr:{L_thresh:.1f}",
-                        (x_min, max(0, y_min-28)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2, cv2.LINE_AA)
+            secs = tracker.tracks[track_id].on_total_ms / 1000.0
+            cv2.putText(frame, f"ID:{track_id} look:{'ON' if is_on else 'off'} {secs:0.1f}s",
+                        (x_min, max(0, y_min-46)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,200,255), 2, cv2.LINE_AA)
+
+            # cv2.putText(frame, f"ID:{track_id} L:{L:.1f} thr:{L_thresh:.1f}",
+            #             (x_min, max(0, y_min-28)),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2, cv2.LINE_AA)
             if is_on:
                 cv2.putText(frame, "Looking at you",
                             (x_min, max(0, y_min-10)),
