@@ -25,6 +25,99 @@ from pathlib import Path
 
 
 
+import itertools
+from dataclasses import dataclass
+
+def iou_xyxy(a, b):
+    ax0, ay0, ax1, ay1 = a; bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0, ix1-ix0), max(0, iy1-iy0)
+    inter = iw * ih
+    if inter <= 0: return 0.0
+    area_a = max(0, ax1-ax0) * max(0, ay1-ay0)
+    area_b = max(0, bx1-bx0) * max(0, by1-by0)
+    union = area_a + area_b - inter
+    return inter / max(union, 1e-9)
+
+@dataclass
+class Track:
+    track_id: int
+    bbox: tuple  # (x0,y0,x1,y1)
+    ema_pitch: float | None = None
+    ema_yaw: float | None = None
+    last_seen: int = 0
+
+class FaceTracker:
+    def __init__(self, iou_thresh=0.3, max_age=15, alpha=0.2):
+        self.iou_thresh = iou_thresh
+        self.max_age = max_age
+        self.alpha = alpha
+        self.tracks: dict[int, Track] = {}
+        self._next_id = 1
+        self.frame_idx = 0
+
+    def _smooth(self, tr: Track, pitch, yaw):
+        if tr.ema_pitch is None:
+            tr.ema_pitch, tr.ema_yaw = float(pitch), float(yaw)
+        else:
+            a = self.alpha
+            tr.ema_pitch = (1-a)*tr.ema_pitch + a*float(pitch)
+            tr.ema_yaw   = (1-a)*tr.ema_yaw   + a*float(yaw)
+        return tr.ema_pitch, tr.ema_yaw
+
+    def update(self, detections):
+        """detections: list of (x0,y0,x1,y1) ints"""
+        self.frame_idx += 1
+
+        # mark all as unmatched initially
+        unmatched_det = list(range(len(detections)))
+        unmatched_trk = list(self.tracks.keys())
+        matches = []
+
+        # greedy IoU matching
+        if self.tracks and detections:
+            pairs = []
+            for ti in self.tracks:
+                tb = self.tracks[ti].bbox
+                for di, db in enumerate(detections):
+                    pairs.append((1.0 - iou_xyxy(tb, db), ti, di))  # sort by (1 - IoU)
+            pairs.sort()
+            used_t, used_d = set(), set()
+            for cost, ti, di in pairs:
+                if ti in used_t or di in used_d: 
+                    continue
+                iou = 1.0 - cost
+                if iou >= self.iou_thresh:
+                    matches.append((ti, di))
+                    used_t.add(ti); used_d.add(di)
+            unmatched_trk = [ti for ti in self.tracks if ti not in used_t]
+            unmatched_det = [di for di in range(len(detections)) if di not in used_d]
+
+        # update matched tracks
+        for ti, di in matches:
+            self.tracks[ti].bbox = detections[di]
+            self.tracks[ti].last_seen = self.frame_idx
+
+        # create new tracks for unmatched detections
+        for di in unmatched_det:
+            ti = self._next_id; self._next_id += 1
+            self.tracks[ti] = Track(track_id=ti, bbox=detections[di], last_seen=self.frame_idx)
+
+        # GC stale tracks
+        to_del = [ti for ti, tr in self.tracks.items()
+                  if (self.frame_idx - tr.last_seen) > self.max_age]
+        for ti in to_del: del self.tracks[ti]
+
+        # return list of (track_id, bbox)
+        return [(ti, self.tracks[ti].bbox) for ti in self.tracks]
+
+    def smooth_angles_for(self, track_id, pitch, yaw):
+        return self._smooth(self.tracks[track_id], pitch, yaw)
+
+
+
+
 def _ort_type_to_np(ort_type: str):
     # onnxruntime uses strings like 'tensor(float)'
     return {
@@ -50,6 +143,26 @@ L_THRESH_MAX_PX = 60.0
 
 
 
+class EMASmoother:
+    def __init__(self, alpha=0.2):
+        self.alpha = alpha
+        self.pitch_ema = None
+        self.yaw_ema = None
+
+    def smooth(self, pitch, yaw):
+        if self.pitch_ema is None:
+            # initialize on first call
+            self.pitch_ema = pitch
+            self.yaw_ema = yaw
+        else:
+            self.pitch_ema = self.alpha * pitch + (1 - self.alpha) * self.pitch_ema
+            self.yaw_ema   = self.alpha * yaw   + (1 - self.alpha) * self.yaw_ema
+        return self.pitch_ema, self.yaw_ema
+
+
+
+
+
 def _fx_fy(img_w, img_h, hfov_deg=90.0, vfov_deg=None):
     fx = (img_w/2.0) / np.tan(np.deg2rad(hfov_deg)/2.0)
     if vfov_deg is None:
@@ -59,14 +172,19 @@ def _fx_fy(img_w, img_h, hfov_deg=90.0, vfov_deg=None):
     fy = (img_h/2.0) / np.tan(np.deg2rad(vfov)/2.0)
     return fx, fy
 
-def gaze_offset_px(pitch, yaw, w, h, hfov_deg=90.0, vfov_deg=None, y_up=False):
-    """
-    Project the gaze (pitch,yaw in radians) to pixel offsets from the face center.
-    Returns (du, dv) in pixels. Length sqrt(du^2+dv^2) is your on-screen vector length.
-    """
+# def gaze_offset_px(pitch, yaw, w, h, hfov_deg=90.0, vfov_deg=None, y_up=False):
+#     """
+#     Project the gaze (pitch,yaw in radians) to pixel offsets from the face center.
+#     Returns (du, dv) in pixels. Length sqrt(du^2+dv^2) is your on-screen vector length.
+#     """
+#     u = fx * np.tan(yaw)                         # right +
+#     v = fy * np.tan(-pitch if y_up else pitch)   # up + if y_up, else y-down
+#     return float(u), float(v)
+def gaze_offset_px(pitch, yaw, fx, fy, y_up=False):
     u = fx * np.tan(yaw)                         # right +
     v = fy * np.tan(-pitch if y_up else pitch)   # up + if y_up, else y-down
     return float(u), float(v)
+
 
 
 
@@ -259,7 +377,13 @@ class GazeEstimationONNX:
         return pitch_deg, yaw_deg
 
 
+REF_FACE  = 120.0   # px
+THR_CLOSE = 130.0   # px when face≈REF_FACE
+THR_FAR   = 35.0    # px cap for tiny/far faces
 
+def gaze_thresh_px(face_px: float) -> float:
+    scale = face_px / REF_FACE
+    return float(np.clip(THR_CLOSE * scale, THR_FAR, THR_CLOSE))
 
 
 
@@ -337,20 +461,24 @@ if __name__ == "__main__":
         writer = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
 
 
+    fx, fy = None, None  # camera intrinsics in pixels (focal lengths)
+    w0, h0 = None, None  # last-seen frame size
 
     # Compute a persistent pixel threshold from the chosen %. Recompute if resolution changes.
     ret, frame0 = cap.read()
     if not ret:
         raise IOError("Could not grab first frame to size threshold.")
+
     h0, w0 = frame0.shape[:2]
+    fx, fy = _fx_fy(w0, h0, hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG)
+
     L_thresh_px = float(np.clip(L_THRESH_INIT * min(w0, h0), L_THRESH_MIN_PX, L_THRESH_MAX_PX))
 
     # If you want to reuse that first frame, show it, then continue as usual:
     cv2.imshow("Gaze Estimation", frame0)
 
 
-    fx, fy = None, None  # camera intrinsics in pixels (focal lengths)
-    w0, h0 = None, None  # last-seen frame size
+    tracker = FaceTracker(iou_thresh=0.35, max_age=20, alpha=0.22)  # tweak alpha 0.15–0.3
     
 
     while cap.isOpened():
@@ -360,7 +488,7 @@ if __name__ == "__main__":
 
 
         h, w = frame.shape[:2]
-        if (w0 is None or w != w0) or (h is None or h != h0):
+        if (w != w0) or (h != h0):
             # resolution changed (e.g., camera renegotiated)
             fx, fy = _fx_fy(w, h, hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG)
             w0, h0 = w, h
@@ -369,111 +497,101 @@ if __name__ == "__main__":
         bboxes, _ = detector.detect(frame)
 
         for bbox in bboxes:
-            x_min, y_min, x_max, y_max = map(int, bbox[:4])
-            face_crop = frame[y_min:y_max, x_min:x_max]
-            if face_crop.size == 0:
-                continue
+            # x_min, y_min, x_max, y_max = map(int, bbox[:4])
+            # face_crop = frame[y_min:y_max, x_min:x_max]
+            # if face_crop.size == 0:
+            #     continue
 
                 
-            w_box = x_max - x_min
-            h_box = y_max - y_min
+            # w_box = x_max - x_min
+            # h_box = y_max - y_min
+
+            # # Skip small faces
+            # if min(w_box, h_box) < 64: # 48   # ~48 for 1080p; consider 64–96 for 4K
+            #     continue
                 
 
 
-            pitch, yaw = engine.estimate(face_crop)  # radians
-            draw_bbox_gaze(frame, bbox, pitch, yaw)
-
-            # # Build 3D gaze vector (unit length), compare to camera forward (0,0,1)
-            # gvec = gaze_vector_from_angles(pitch, yaw, convention="y_up")
-            # looking, angle_deg = is_looking_at_camera(gvec, thresh_deg=10.0)  # tweak threshold 8–12°
-
-            # if looking:
-            #     # Optional: also check that the face center is near image center (helps avoid false positives)
-            #     h, w = frame.shape[:2]
-            #     cx = (x_min + x_max) // 2
-            #     cy = (y_min + y_max) // 2
-            #     # distance from center normalized by min dimension
-            #     d = np.hypot(cx - w//2, cy - h//2) / max(1, min(w, h))
-            #     if d < 0.2:  # tweak 0.15–0.25 depending on your FOV
-            #         cv2.putText(frame, "Looking at you",
-            #                     (x_min, max(0, y_min - 10)),
-            #                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
-
-
-            # # Clamp & (optionally) smooth your angles
-            # pitch = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
-            # yaw   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
-            # pitch_s, yaw_s = look_filter.smooth_angles(pitch, yaw)  # reuse your EMA
-
-
+            # pitch, yaw = engine.estimate(face_crop)  # radians
+            # draw_bbox_gaze(frame, bbox, pitch, yaw)
 
                         
-            # Clamp angles to model range before projecting (avoids tan blowups)
-            pitch_c = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
-            yaw_c   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
+            # # Clamp angles to model range before projecting (avoids tan blowups)
+            # pitch_c = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
+            # yaw_c   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
 
-            # Project gaze to pixel offsets
-            du, dv = gaze_offset_px(pitch_c, yaw_c, w, h,
-                hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG, y_up=Y_UP)
-
-            # du_n = du / max(1.0, float(w_box))
-            # dv_n = dv / max(1.0, float(h_box))
-            # L_norm = (du_n*du_n + dv_n*dv_n) ** 0.5
-
-            # # L_thresh_px is in pixels (e.g., 40–60 at 4K)
-            # face_scale = max(1.0, float(min(w_box, h_box)))
+            # # Project gaze to pixel offsets
+            # du, dv = gaze_offset_px(pitch_c, yaw_c, fx, fy, y_up=Y_UP)
+            # L = (du*du + dv*dv) ** 0.5
 
 
-            # Determined experimentally
-            # L_thresh_px = 45
-            # thr_norm = L_thresh_px / face_scale   # convert px → unitless
+            # # Current face box size
+            # face_sz = float(min(w_box, h_box))
 
-            # is_on = (L_norm <= thr_norm)
+            # # Scale factor: bigger faces → higher threshold
+            # scale = face_sz / REF_FACE
 
-
-
-
-            L = (du*du + dv*dv) ** 0.5
-
-            REF_FACE = 120.0  # px
-            THR_CLOSE = 130.0 # px tolerance when face size ≈ REF_FACE
-            THR_FAR   = 35 # 40.0  # px tolerance when face is much smaller
-
-            # Current face box size
-            face_sz = float(min(w_box, h_box))
-
-            # Scale factor: bigger faces → higher threshold
-            scale = face_sz / REF_FACE
-
-            # Interpolate threshold between far and close
-            L_thresh_px = np.clip(THR_CLOSE * scale, THR_FAR, THR_CLOSE)
+            # # Interpolate threshold between far and close
+            # L_thresh = gaze_thresh_px(face_sz)
 
 
-            is_on = (L <= L_thresh_px)
+            # is_on = (L <= L_thresh)
+           
+
+            # cv2.putText(frame, f"L:{L:.1f} thr:{L_thresh:.1f} {'ON' if is_on else 'off'}",
+            #             (x_min, max(0, y_min - 28)),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2, cv2.LINE_AA)
+
+            # if is_on:
+            #     cv2.putText(frame, "Looking at you",
+            #                 (x_min, max(0, y_min - 10)),
+            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
 
 
 
+            # Prepare detections as integer tuples
+            dets = [tuple(map(int, bbox[:4])) for bbox in bboxes]
+            tracked = tracker.update(dets)  # -> list of (track_id, bbox)
 
+            for track_id, (x_min, y_min, x_max, y_max) in tracked:
+                face_crop = frame[y_min:y_max, x_min:x_max]
+                if face_crop.size == 0:
+                    continue
 
+                # Skip tiny faces (helps stability)
+                w_box = x_max - x_min; h_box = y_max - y_min
+                if min(w_box, h_box) < 64:
+                    continue
 
+                # Estimate raw angles
+                pitch, yaw = engine.estimate(face_crop)  # radians
 
+                # Clamp, then EMA per-track
+                pitch_c = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
+                yaw_c   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
+                pitch_s, yaw_s = tracker.smooth_angles_for(track_id, pitch_c, yaw_c)
 
+                # Draw using smoothed values (optional: pass smoothed to your drawer)
+                draw_bbox_gaze(frame, (x_min, y_min, x_max, y_max), pitch_s, yaw_s)
 
+                # Project to pixels with cached fx, fy
+                du, dv = gaze_offset_px(pitch_s, yaw_s, fx, fy, y_up=Y_UP)
+                L = (du*du + dv*dv) ** 0.5
 
+                # Threshold scales with face size (your function)
+                face_sz = float(min(w_box, h_box))
+                L_thresh = gaze_thresh_px(face_sz)
+                is_on = (L <= L_thresh)
 
+                # Debug overlay with track id
+                cv2.putText(frame, f"ID:{track_id} L:{L:.1f} thr:{L_thresh:.1f}",
+                            (x_min, max(0, y_min-28)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2, cv2.LINE_AA)
+                if is_on:
+                    cv2.putText(frame, "Looking at you",
+                                (x_min, max(0, y_min-10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
 
-            
-
-            cv2.putText(frame, f"L:{L:.1f} thr:{L_thresh_px:.1f} {'ON' if is_on else 'off'}",
-                        (x_min, max(0, y_min - 28)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2, cv2.LINE_AA)
-
-            if is_on:
-                cv2.putText(frame, "Looking at you",
-                            (x_min, max(0, y_min - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
-
-                                
 
         if writer:
             writer.write(frame)
