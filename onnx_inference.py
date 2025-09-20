@@ -195,6 +195,62 @@ L_THRESH_MAX_PX = 60.0
 
 
 
+
+# --- False-positive filters (add near other tunables) ---
+DET_CONF_THRESH   = 0.80     # raise if you still see wall hits (0.85–0.90)
+MIN_FACE_PX       = 64       # min box side (px); raise if camera is close
+MAX_REL_FACE      = 0.45     # max box fraction of min(frame_w, frame_h)
+
+# If the wall artifact is always in the same area, exclude it:
+# Set to None to disable, or fill in (x, y, w, h)
+EXCLUDE_RECT      = None     # e.g., (400, 120, 200, 180)
+
+# Texture filter: flat / low-variance ROIs are likely not real faces
+TEXTURE_VAR_MIN   = 70.0     # bump to ~90–120 if walls still slip through
+
+EXCLUDE_RECT_COLOR = (255, 0, 255)   # magenta in BGR (blue=255, green=0, red=255)
+EXCLUDE_RECT_THICK = 2
+EXCLUDE_FILL_ALPHA = 0.18            # optional translucent fill
+
+
+
+
+
+
+def in_excluded_region(box, excl_rect):
+    if excl_rect is None:
+        return False
+    x0, y0, x1, y1 = box
+    ex, ey, ew, eh = excl_rect
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    return (ex <= cx <= ex + ew) and (ey <= cy <= ey + eh)
+
+def size_ok_xyxy(box, frame_shape):
+    x0, y0, x1, y1 = box
+    w = max(0, x1 - x0)
+    h = max(0, y1 - y0)
+    if min(w, h) < MIN_FACE_PX:
+        return False
+    max_abs = int(MAX_REL_FACE * min(frame_shape[1], frame_shape[0]))
+    return (w <= max_abs) and (h <= max_abs)
+
+def texture_ok_gray(gray, box):
+    x0, y0, x1, y1 = [int(v) for v in box]
+    x0 = max(0, x0); y0 = max(0, y0)
+    x1 = min(gray.shape[1], x1); y1 = min(gray.shape[0], y1)
+    roi = gray[y0:y1, x0:x1]
+    if roi.size == 0:
+        return False
+    lap_var = cv2.Laplacian(roi, cv2.CV_64F).var()
+    return lap_var >= TEXTURE_VAR_MIN
+
+
+
+
+
+
+
 def _fx_fy(img_w, img_h, hfov_deg=90.0, vfov_deg=None):
     fx = (img_w/2.0) / np.tan(np.deg2rad(hfov_deg)/2.0)
     if vfov_deg is None:
@@ -527,10 +583,57 @@ if __name__ == "__main__":
             
 
         bboxes, _ = detector.detect(frame)
-        
-        # Prepare detections as integer tuples
-        dets = [tuple(map(int, bbox[:4])) for bbox in bboxes]
-        tracked = tracker.update(dets)  # -> list of (track_id, bbox)
+
+        # Prepare gray once for texture check
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        dets = []
+        for b in bboxes:
+            # Be robust to output shapes: [x0,y0,x1,y1,score?]
+            if len(b) >= 5:
+                x0, y0, x1, y1, score = b[:5]
+            else:
+                x0, y0, x1, y1 = b[:4]
+                score = 1.0  # if API doesn’t return score, treat as 1.0 (still filtered by texture/size/mask)
+
+            # 1) confidence gate
+            if score < DET_CONF_THRESH:
+                continue
+
+            box = (int(x0), int(y0), int(x1), int(y1))
+
+            # 2) region exclude (fixed wall spot)
+            if in_excluded_region(box, EXCLUDE_RECT):
+                continue
+
+            # 3) size sanity
+            if not size_ok_xyxy(box, frame.shape):
+                continue
+
+            # 4) texture / variance
+            if not texture_ok_gray(gray, box):
+                continue
+
+            dets.append(box)
+
+        # Optionally draw excluded region for debug
+        if EXCLUDE_RECT is not None:
+            ex, ey, ew, eh = EXCLUDE_RECT
+            # outline
+            cv2.rectangle(
+                frame, (ex, ey), (ex + ew, ey + eh),
+                EXCLUDE_RECT_COLOR, EXCLUDE_RECT_THICK, lineType=cv2.LINE_AA
+            )
+
+            # optional translucent fill so it really stands out
+            if EXCLUDE_FILL_ALPHA and EXCLUDE_FILL_ALPHA > 0:
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (ex, ey), (ex + ew, ey + eh), EXCLUDE_RECT_COLOR, thickness=-1)
+                frame[:] = cv2.addWeighted(overlay, EXCLUDE_FILL_ALPHA, frame, 1 - EXCLUDE_FILL_ALPHA, 0)
+
+        tracked = tracker.update(dets)
+
+
 
         for track_id, (x_min, y_min, x_max, y_max) in tracked:
             face_crop = frame[y_min:y_max, x_min:x_max]
