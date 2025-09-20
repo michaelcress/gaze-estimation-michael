@@ -2,6 +2,7 @@ data/
 output/
 weights/
 assets/
+trt_cache/
 
 *.pt
 *.onnx

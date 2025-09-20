@@ -8,3 +8,8 @@ python inference.py --model resnet34 --weight output/best_model.pt --view --data
 
 
 
+python onnx_export.py --weight output/best_model.pt --model resnet34 --dynamic --dataset mpiigaze
+
+
+python onnx_inference.py --source http://192.168.2.223:8080 --model ./best_model_gaze.onnx # --output [path to save video]
+
