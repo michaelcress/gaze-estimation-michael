@@ -64,7 +64,6 @@ def gaze_offset_px(pitch, yaw, w, h, hfov_deg=90.0, vfov_deg=None, y_up=False):
     Project the gaze (pitch,yaw in radians) to pixel offsets from the face center.
     Returns (du, dv) in pixels. Length sqrt(du^2+dv^2) is your on-screen vector length.
     """
-    fx, fy = _fx_fy(w, h, hfov_deg, vfov_deg)
     u = fx * np.tan(yaw)                         # right +
     v = fy * np.tan(-pitch if y_up else pitch)   # up + if y_up, else y-down
     return float(u), float(v)
@@ -350,11 +349,22 @@ if __name__ == "__main__":
     cv2.imshow("Gaze Estimation", frame0)
 
 
+    fx, fy = None, None  # camera intrinsics in pixels (focal lengths)
+    w0, h0 = None, None  # last-seen frame size
+    
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
+
+
+        h, w = frame.shape[:2]
+        if (w0 is None or w != w0) or (h is None or h != h0):
+            # resolution changed (e.g., camera renegotiated)
+            fx, fy = _fx_fy(w, h, hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG)
+            w0, h0 = w, h
+            
 
         bboxes, _ = detector.detect(frame)
 
@@ -363,6 +373,12 @@ if __name__ == "__main__":
             face_crop = frame[y_min:y_max, x_min:x_max]
             if face_crop.size == 0:
                 continue
+
+                
+            w_box = x_max - x_min
+            h_box = y_max - y_min
+                
+
 
             pitch, yaw = engine.estimate(face_crop)  # radians
             draw_bbox_gaze(frame, bbox, pitch, yaw)
@@ -389,16 +405,64 @@ if __name__ == "__main__":
             # yaw   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
             # pitch_s, yaw_s = look_filter.smooth_angles(pitch, yaw)  # reuse your EMA
 
+
+
                         
             # Clamp angles to model range before projecting (avoids tan blowups)
             pitch_c = float(np.clip(pitch, np.deg2rad(-42), np.deg2rad(42)))
             yaw_c   = float(np.clip(yaw,   np.deg2rad(-42), np.deg2rad(42)))
 
-            h, w = frame.shape[:2]
-            du, dv = gaze_offset_px(pitch_c, yaw_c, w, h, hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG, y_up=Y_UP)
+            # Project gaze to pixel offsets
+            du, dv = gaze_offset_px(pitch_c, yaw_c, w, h,
+                hfov_deg=HFOV_DEG, vfov_deg=VFOV_DEG, y_up=Y_UP)
+
+            # du_n = du / max(1.0, float(w_box))
+            # dv_n = dv / max(1.0, float(h_box))
+            # L_norm = (du_n*du_n + dv_n*dv_n) ** 0.5
+
+            # # L_thresh_px is in pixels (e.g., 40–60 at 4K)
+            # face_scale = max(1.0, float(min(w_box, h_box)))
+
+
+            # Determined experimentally
+            # L_thresh_px = 45
+            # thr_norm = L_thresh_px / face_scale   # convert px → unitless
+
+            # is_on = (L_norm <= thr_norm)
+
+
+
+
             L = (du*du + dv*dv) ** 0.5
 
-            is_on = (L <= L_thresh_px)  # simple, flicker-free rule
+            REF_FACE = 120.0  # px
+            THR_CLOSE = 130.0 # px tolerance when face size ≈ REF_FACE
+            THR_FAR   = 35 # 40.0  # px tolerance when face is much smaller
+
+            # Current face box size
+            face_sz = float(min(w_box, h_box))
+
+            # Scale factor: bigger faces → higher threshold
+            scale = face_sz / REF_FACE
+
+            # Interpolate threshold between far and close
+            L_thresh_px = np.clip(THR_CLOSE * scale, THR_FAR, THR_CLOSE)
+
+
+            is_on = (L <= L_thresh_px)
+
+
+
+
+
+
+
+
+
+
+
+
+            
 
             cv2.putText(frame, f"L:{L:.1f} thr:{L_thresh_px:.1f} {'ON' if is_on else 'off'}",
                         (x_min, max(0, y_min - 28)),
@@ -418,11 +482,11 @@ if __name__ == "__main__":
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord(']'):
-            L_thresh_px *= 1.1    # looser
-        elif key == ord('['):
-            L_thresh_px /= 1.1    # stricter
-            L_thresh_px = float(np.clip(L_thresh_px, L_THRESH_MIN_PX, L_THRESH_MAX_PX))
+        # elif key == ord(']'):
+        #     L_thresh_px *= 1.1    # looser
+        # elif key == ord('['):
+        #     L_thresh_px /= 1.1    # stricter
+        #     L_thresh_px = float(np.clip(L_thresh_px, L_THRESH_MIN_PX, L_THRESH_MAX_PX))
 
     cap.release()
     if writer:
