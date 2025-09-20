@@ -21,6 +21,9 @@ from typing import Tuple
 from utils.helpers import draw_bbox_gaze
 
 
+from pathlib import Path
+
+
 
 def _ort_type_to_np(ort_type: str):
     # onnxruntime uses strings like 'tensor(float)'
@@ -32,114 +35,37 @@ def _ort_type_to_np(ort_type: str):
     }.get(ort_type, np.float32)
 
 
-# class GazeEstimationONNX:
-#     """
-#     Gaze estimation using ONNXRuntime (logits to radian decoded).
-#     """
+def gaze_vector_from_angles(pitch_rad: float, yaw_rad: float, convention="y_up"):
+    """
+    Convert (pitch,yaw) -> 3D unit vector.
+    - pitch: up(+)/down(-) in radians
+    - yaw:   right(+)/left(-) in radians
+    convention:
+      "y_up":  x right, y up, z forward
+      "y_down": x right, y down, z forward
+    """
+    cp = np.cos(pitch_rad); sp = np.sin(pitch_rad)
+    cy = np.cos(yaw_rad);   sy = np.sin(yaw_rad)
 
-#     def __init__(self, model_path: str, session: ort.InferenceSession = None) -> None:
-#         """Initializes the GazeEstimationONNX class.
+    # x right, z forward, choose y sign by convention
+    vx = cp * sy
+    vy = (-sp if convention == "y_up" else sp)
+    vz = cp * cy
+    v = np.array([vx, vy, vz], dtype=np.float32)
+    # Normalize just in case
+    n = np.linalg.norm(v)
+    return v / (n + 1e-9)
 
-#         Args:
-#             model_path (str): Path to the ONNX model file.
-#             session (ort.InferenceSession, optional): ONNX Session. Defaults to None.
+def is_looking_at_camera(gaze_vec: np.ndarray, fwd=np.array([0,0,1],dtype=np.float32), thresh_deg=10.0):
+    """
+    True if angle between gaze_vec and camera forward is within thresh_deg.
+    """
+    gaze = gaze_vec / (np.linalg.norm(gaze_vec) + 1e-9)
+    fwd  = fwd / (np.linalg.norm(fwd) + 1e-9)
+    cos_t = float(np.clip(np.dot(gaze, fwd), -1.0, 1.0))
+    theta = np.degrees(np.arccos(cos_t))
+    return theta <= thresh_deg, theta
 
-#         Raises:
-#             AssertionError: If model_path is None and session is not provided.
-#         """
-#         self.session = session
-#         if self.session is None:
-#             assert model_path is not None, "Model path is required for the first time initialization."
-#             # self.session = ort.InferenceSession(
-#             #     model_path,
-#             #     providers=["CPUExecutionProvider", "CUDAExecutionProvider"]
-#             # )
-
-#             sess_opts = ort.SessionOptions()
-#             sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-#             trt_options = {
-#                 "trt_fp16_enable": True,                    # FP16 is a sweet spot on Jetson
-#                 "trt_int8_enable": False,                   # turn on only if you have Q/DQ or a calibrator
-#                 "trt_engine_cache_enable": True,            # cache engines to avoid rebuilds
-#                 "trt_engine_cache_path": "./trt_cache",     # make sure this path exists
-#                 # Optional tuning knobs:
-#                 # "trt_max_workspace_size": 1 * 1024**3,    # adjust for large models
-#                 # "trt_timing_cache_enable": True,
-#                 # "trt_dla_enable": True,                   # only if your module has DLA and model supports it
-#                 # "trt_dla_core": 0,
-#             }
-
-#             providers = [
-#                 ("TensorrtExecutionProvider", trt_options),
-#                 "CUDAExecutionProvider",
-#                 "CPUExecutionProvider",
-#             ]
-
-#             self.session = ort.InferenceSession(model_path, sess_options=sess_opts, providers=providers)
-#             print("Using:", self.session.get_providers())
-
-
-#         self._bins = 90
-#         self._binwidth = 4
-#         self._angle_offset = 180
-#         self.idx_tensor = np.arange(self._bins, dtype=np.float32)
-
-#         self.input_shape = (448, 448)
-#         self.input_mean = [0.485, 0.456, 0.406]
-#         self.input_std = [0.229, 0.224, 0.225]
-
-#         input_cfg = self.session.get_inputs()[0]
-#         input_shape = input_cfg.shape
-
-#         self.input_name = input_cfg.name
-#         self.input_size = tuple(input_shape[2:][::-1])
-
-#         outputs = self.session.get_outputs()
-#         output_names = [output.name for output in outputs]
-
-#         self.output_names = output_names
-#         assert len(output_names) == 2, "Expected 2 output nodes, got {}".format(len(output_names))
-
-#     def preprocess(self, image: np.ndarray) -> np.ndarray:
-#         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-#         image = cv2.resize(image, self.input_size)  # Resize to 448x448
-
-#         image = image.astype(np.float32) / 255.0
-
-#         mean = np.array(self.input_mean, dtype=np.float32)
-#         std = np.array(self.input_std, dtype=np.float32)
-#         image = (image - mean) / std
-
-#         image = np.transpose(image, (2, 0, 1))  # HWC → CHW
-#         image_batch = np.expand_dims(image, axis=0).astype(np.float32)  # CHW → BCHW
-
-#         return image_batch
-
-#     def softmax(self, x: np.ndarray) -> np.ndarray:
-#         e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
-#         return e_x / e_x.sum(axis=1, keepdims=True)
-
-#     def decode(self, pitch_logits: np.ndarray, yaw_logits: np.ndarray) -> Tuple[float, float]:
-#         pitch_probs = self.softmax(pitch_logits)
-#         yaw_probs = self.softmax(yaw_logits)
-
-#         pitch = np.sum(pitch_probs * self.idx_tensor, axis=1) * self._binwidth - self._angle_offset
-#         yaw = np.sum(yaw_probs * self.idx_tensor, axis=1) * self._binwidth - self._angle_offset
-
-#         return np.radians(pitch[0]), np.radians(yaw[0])
-
-#     def estimate(self, face_image: np.ndarray) -> Tuple[float, float]:
-#         input_tensor = self.preprocess(face_image)
-#         outputs = self.session.run(self.output_names, {"input": input_tensor})
-
-#         return self.decode(outputs[0], outputs[1])
-
-
-
-import numpy as np
-import onnxruntime as ort
-from pathlib import Path
 
 def _softmax(x, axis=-1):
     x = x.astype(np.float32)
@@ -388,8 +314,26 @@ if __name__ == "__main__":
             if face_crop.size == 0:
                 continue
 
-            pitch, yaw = engine.estimate(face_crop)
+            pitch, yaw = engine.estimate(face_crop)  # radians
             draw_bbox_gaze(frame, bbox, pitch, yaw)
+
+            # Build 3D gaze vector (unit length), compare to camera forward (0,0,1)
+            gvec = gaze_vector_from_angles(pitch, yaw, convention="y_up")
+            looking, angle_deg = is_looking_at_camera(gvec, thresh_deg=10.0)  # tweak threshold 8–12°
+
+            if looking:
+                # Optional: also check that the face center is near image center (helps avoid false positives)
+                h, w = frame.shape[:2]
+                cx = (x_min + x_max) // 2
+                cy = (y_min + y_max) // 2
+                # distance from center normalized by min dimension
+                d = np.hypot(cx - w//2, cy - h//2) / max(1, min(w, h))
+                if d < 0.2:  # tweak 0.15–0.25 depending on your FOV
+                    cv2.putText(frame, "Looking at you",
+                                (x_min, max(0, y_min - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
+
+                                
 
         if writer:
             writer.write(frame)

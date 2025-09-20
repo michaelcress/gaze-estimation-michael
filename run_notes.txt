@@ -1,3 +1,11 @@
+#Pre-requisite
+
+conda deactivate
+conda activate gaze310
+
+
+
+
 python main.py --data data/MPIIFaceGaze --dataset mpiigaze --arch resnet34 --batch-size 100 --num-workers 2 --output output --alpha 1 --amp
 
 
@@ -11,5 +19,5 @@ python inference.py --model resnet34 --weight output/best_model.pt --view --data
 python onnx_export.py --weight output/best_model.pt --model resnet34 --dynamic --dataset mpiigaze
 
 
-python onnx_inference.py --source http://192.168.2.223:8080 --model ./best_model_gaze.onnx # --output [path to save video]
+python onnx_inference.py --source http://192.168.2.223:8080/video --model ./best_model_gaze.onnx                 # --output [path to save video]
 
